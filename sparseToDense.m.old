@@ -1,0 +1,197 @@
+function [acc] = sparseToDense(video, alpha, sigma, lambda, theta, plotFlag)
+%% PARAMETERS
+%  video -- name of video directory containing the frames
+%  alpha -- weighting of colour prob wrt location prob for unary potentials
+%  sigma -- weight of distance for computation of location prob
+%  lambda -- weight of binary potential wrt unary
+%  theta -- mahalanobis distance threshold for initial smoothing (use [1.5, 2.5])
+
+% For cars1, sparseToDense('cars1', 0.2, 10, 10, 1.75, 1)
+% For cars4, sparseToDense('cars4', 0.2, 5, 5, 1.7, 1)
+%%
+    rootDir = fullfile('..', 'datasets', 'BMS-26', 'moseg_dataset');
+%     video = 'cars1';
+    list = dir(fullfile(rootDir, video, 'BroxMalikResults', 'Tracks*.dat'));
+    n = list(end).name;
+    numFrames = sscanf(n, 'Tracks%d.dat');
+    
+    sparseSegFile = fullfile(rootDir, video, 'BroxMalikResults', 'Segments000.ppm');
+    sparseSeg = imread(sparseSegFile);
+    sz = size(sparseSeg); res = sz(1:2);
+    pixels = reshape(sparseSeg, [], 3);
+    [clusterColors, ~, clusterLabels] = unique(pixels, 'rows');
+    clusterCounts = accumarray(clusterLabels, 1);
+
+    %Discount clusters with colors close to white
+    removable = all(clusterColors>=225, 2);
+    clusterCounts(removable, :) = nan;
+
+    %Choose cluster with smallest number of pixels of the remaining as fg
+    [~, fgIdx] = min(clusterCounts);
+    clusterColor = clusterColors(fgIdx, :);
+    fg = clusterLabels==fgIdx;
+    
+    correctSum = 0; totalSum = 0;
+    for f = 0:numFrames-1
+        disp(['Frame ' num2str(f+1) '...']);
+        if f > 0
+            sparseSegFile = fullfile(rootDir, video, 'BroxMalikResults', sprintf('Segments%03d.ppm', f));
+            sparseSeg = imread(sparseSegFile);
+            sz = size(sparseSeg); res = sz(1:2);
+            pixels = reshape(sparseSeg, [], 3);
+            fg = all(bsxfun(@eq, pixels, clusterColor), 2);
+        end
+    %     bg = ~fg;
+        origMask = reshape(fg, res);
+        [I, J] = find(origMask);
+        k = 10;
+        imax = min(res(1),max(I)+k); imin = max(1,min(I)-k);
+        jmax = min(res(2),max(J)+k); jmin = max(1,min(J)-k);
+        
+        actualImgFile = fullfile(rootDir, video, sprintf([video '_%02d.ppm'], f+1));
+        actualImgFull = im2double(imread(actualImgFile));
+        actualImg = actualImgFull(imin:imax, jmin:jmax, :);
+        sz = size(actualImg); res = sz(1:2);
+        pixels = reshape(actualImg, [], 3);
+
+        % Unary potential computation
+        initialLabelMask = origMask(imin:imax, jmin:jmax);
+        initialLabelMask = wiener2(medfilt2(initialLabelMask, [5 5]), [3 3]);
+        [J, I] = find(initialLabelMask);
+        [X, Y] = meshgrid(1:res(2), 1:res(1));
+        pts = [X(:) Y(:)];
+        in = mahal(pts, [I J]) <= theta;
+        initialLabelMask = initialLabelMask | reshape(in, res);
+        fg = initialLabelMask(:);
+        bg = ~fg;
+
+        options = statset('Display', 'final');
+        fgColorGMM = gmdistribution.fit(pixels(fg, :), 3, 'Options', options);
+        bgColorGMM = gmdistribution.fit(pixels(bg, :), 3, 'Options', options);
+        fgProbC = pdf(fgColorGMM, pixels);
+        bgProbC = pdf(bgColorGMM, pixels);
+        fgProbC(fgProbC==0) = eps;
+        bgProbC(bgProbC==0) = eps;
+        fgProbC = fgProbC ./ (fgProbC+bgProbC);
+        bgProbC = bgProbC ./ (fgProbC+bgProbC);
+        
+        
+        distTransform = bwdist(initialLabelMask);
+%         sigma = 5;
+        fgProbL = reshape(exp(-distTransform ./ sigma), [], 1);
+        bgProbL = 1 - fgProbL;
+        fgProbL(fgProbL==0) = eps;
+        bgProbL(bgProbL==0) = eps;
+%         alpha = 0.2;
+        fgProb = alpha * fgProbC + (1-alpha) * fgProbL;
+        bgProb = alpha * bgProbC + (1-alpha) * bgProbL;
+        unary = -log([(1-fgProb)'; (1-bgProb)']);
+
+        %Visualization
+        if plotFlag==1
+            fig = figure('Name', ['Frame ' num2str(f+1) ' - Verification'], 'NumberTitle', 'off');
+            set(fig, 'WindowStyle', 'docked');
+            warning('off', 'last');
+            subplot(2,5,1), imshow(actualImg);
+            subplot(2,5,2), imshow(reshape(fgProbC, res));
+            subplot(2,5,3), imshow(reshape(fgProbL, res));
+            %     fgProbImg = fgProbCImg.*fgProbLImg;
+            subplot(2,5,4), imshow(reshape(fgProb, res));
+            subplot(2,5,5), imshow(mat2gray(reshape(unary(1, :), res)));
+            subplot(2,5,6), imshow(sparseSeg(imin:imax, jmin:jmax, :));
+            subplot(2,5,7), imshow(reshape(bgProbC, res));
+            subplot(2,5,8), imshow(reshape(bgProbL, res));
+            %     fgProbImg = fgProbCImg.*fgProbLImg;
+            subplot(2,5,9), imshow(reshape(bgProb, res));
+            subplot(2,5,10), imshow(mat2gray(reshape(unary(2, :), res)));
+        end
+
+        % Binary potential computation
+        len = 9*res(1)*res(2) - 6*(res(1) + res(2)) + 4;
+        pt_arr = zeros(len , 1);
+        nbr_arr = zeros(len , 1);
+        val_arr = zeros(len , 1);
+        dsum = 0; num = 0;
+        a = 1;
+        for i = 1:res(1)
+            for j = 1:res(2)
+                ind = (j-1)*res(1) + i;
+                pt = pixels(ind, :);
+    %             a1 = a;
+    %             dsum = 0; num = 0;
+    %           assert(all(pt == reshape(actualImg(i, j, :), [], 3)));
+                for k = max(1,i-1):min(res(1),i+1)
+                    for l = max(1,j-1):min(res(2),j+1)
+                        indNbr = (l-1)*res(1) + k;
+                        nbr = pixels(indNbr, :);
+    %                     assert(all(nbr == reshape(actualImg(k, l, :), [], 3)));
+                        x = pt - nbr;
+                        d = x*x'; % d = sq-euc-dist(pt, nbr)
+                        pt_arr(a) = ind;
+                        nbr_arr(a) = indNbr;
+                        val_arr(a) = d;
+                        %pairwise(ind, indNbr) = d;
+                        dsum = dsum + d;
+                        num = num + 1;
+                        a = a + 1;
+                    end
+                end
+    %             a2 = a - 1;
+    %             if dsum==0
+    %                 beta = 0;
+    %             else
+    %                 beta = num / (2 * dsum);
+    %             end
+    %             val_arr(a1:a2) = exp(-beta * val_arr(a1:a2));
+            end
+        end
+        %}
+    %     dsum = sum(val_arr);
+        avgd = dsum/len;
+        if avgd==0
+            beta = 0;
+        else
+            beta = 1 / (2 * avgd);
+        end
+
+        beta = double(beta);
+%         lambda = 5;
+        val_arr = lambda * exp(-beta*val_arr);
+    %     val_arr = val_arr / max(val_arr);
+        pairwise = sparse(pt_arr, nbr_arr, val_arr);
+    %     clear('actualImg', 'bg', 'bgProbC', 'bgProbL', 'clusterLabels', 'distTransform', 'fgProbC', 'fgProbL', 'initialLabelMask', 'nbr_arr', 'pixels', 'pt_arr', 'val_arr');
+
+        %Label costs
+        labelcost = 1 * (1 - eye(2));
+
+    %     E = inf; Eafter = 0;
+        labels = double(fg');
+        if plotFlag==1
+            fig = figure('Name', ['Frame ' num2str(f+1) ' - Results'], 'NumberTitle', 'off');
+            set(fig, 'WindowStyle', 'docked');
+            subplot(1,3,1), imshow(reshape(labels, res));
+        end
+        [labels, E, Eafter] = GCMex(labels, single(unary), pairwise, single(labelcost));
+        display(E); display(Eafter);
+        denseSegMask = reshape(labels, res);
+        denseSegImg = bsxfun(@times, actualImg, denseSegMask);
+        denseSegMaskFull = origMask;
+        denseSegMaskFull(imin:imax, jmin:jmax) = denseSegMask;
+        denseSegImgFull = zeros(size(actualImgFull));
+        denseSegImgFull(imin:imax, jmin:jmax, :) = denseSegImg;
+        if plotFlag==1
+            subplot(1,3,2), imshow(denseSegMaskFull);
+            subplot(1,3,3), imshow(denseSegImgFull);
+        end
+        gtFile = fullfile(rootDir, video, sprintf([video '_%02d.pgm'], f+1));
+        if exist(gtFile, 'file')
+            gtImg = imread(gtFile);
+            gtImg = gtImg==255;
+            correct = denseSegMaskFull==gtImg;
+            correctSum = correctSum + sum(correct(:));
+            totalSum = totalSum + length(correct(:));
+        end
+    end
+    acc = correctSum / totalSum;
+end
+
